@@ -1,91 +1,127 @@
 import cv2
-import mediapipe as mp
 import numpy as np
+import mediapipe as mp
 
 # Initialize MediaPipe Hands
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+
+# Initialize MediaPipe Drawing utilities to visualize hand landmarks
 mp_drawing = mp.solutions.drawing_utils
 
 # Set up camera
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(0)  # Use 0 for the default webcam, replace with your webcam device ID
 
-# Initialize variables for corner calibration
-calibrated = False
-ipad_corners = []
+# Define screen dimensions (adjust based on the projector resolution)
+screen_width, screen_height = 1920, 1080  # Example: Full HD resolution
 
-def click_event(event, x, y, flags, param):
-    global ipad_corners, calibrated
+# Coordinates for the 4 corners of the iPad (can be adjusted based on your setup)
+ipad_corners = []  # Initially empty, will be filled by user clicks
+projected_corners = [(0, 0), (screen_width, 0), (screen_width, screen_height), (0, screen_height)]  # Projection corners
+
+# Initialize perspective transformation variables
+pts2 = np.array(projected_corners, dtype="float32")  # Destination points on the projected screen
+pts1 = []  # Initialize as an empty list instead of None
+
+def map_to_screen(x, y, frame_width, frame_height):
+    """
+    Map coordinates from camera frame to screen projection coordinates.
+    """
+    screen_x = int(x * screen_width / frame_width)
+    screen_y = int(y * screen_height / frame_height)
+    return screen_x, screen_y
+
+def draw_corners(frame, corners, w, h):
+    """
+    Draw the four corner markers on the iPad screen in the camera feed.
+    """
+    for corner in corners:
+        x, y = corner
+        # Map the normalized corner coordinates to screen coordinates
+        screen_x, screen_y = map_to_screen(x, y, w, h)
+        # Draw a red marker at each corner
+        cv2.circle(frame, (screen_x, screen_y), 10, (0, 0, 255), cv2.FILLED)  # Red corner markers
+
+def apply_perspective_correction(frame):
+    """
+    Apply perspective correction to the frame using homography transformation.
+    """
+    global pts1
+    if len(pts1) < 4:
+        return frame  # If corners are not selected, return the original frame
+    
+    # Calculate the homography matrix
+    h_matrix, _ = cv2.findHomography(np.array(pts1, dtype="float32"), pts2)
+    
+    # Apply the perspective warp
+    corrected_frame = cv2.warpPerspective(frame, h_matrix, (screen_width, screen_height))
+    
+    return corrected_frame
+
+def select_corners(event, x, y, flags, param):
+    """
+    Callback function to select the 4 corners of the iPad screen.
+    """
+    global pts1
     if event == cv2.EVENT_LBUTTONDOWN:
-        if len(ipad_corners) < 4:
-            ipad_corners.append((x, y))
-            print(f"Corner {len(ipad_corners)} set at: {x}, {y}")
-        if len(ipad_corners) == 4:
-            calibrated = True
+        if len(pts1) < 4:
+            pts1.append([x, y])
+            cv2.circle(frame, (x, y), 10, (255, 0, 0), cv2.FILLED)
+            cv2.imshow("Select Corners", frame)
+            if len(pts1) == 4:
+                print("Four corners selected!")
+                cv2.destroyAllWindows()
 
-# Start the main loop
+# Set up a mouse callback for selecting corners
+cv2.namedWindow("Select Corners")
+cv2.setMouseCallback("Select Corners", select_corners)
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
     
-    # Flip frame for mirror effect and get dimensions
+    # Flip frame horizontally for a mirror effect
     frame = cv2.flip(frame, 1)
     h, w, _ = frame.shape
-
-    # Step 1: Calibration - Set up corners of iPad screen
-    if not calibrated:
-        # Display instruction text
-        cv2.putText(frame, "Click the four corners of the iPad on screen", 
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-
-        # Show the points if any have been selected
-        for corner in ipad_corners:
-            cv2.circle(frame, corner, 5, (0, 0, 255), -1)
-
-        # Set up mouse callback for selecting points
-        cv2.imshow('Calibration', frame)
-        cv2.setMouseCallback('Calibration', click_event)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+    
+    # Wait for the user to select the 4 corners of the iPad
+    if len(pts1) < 4:
+        # Show the live camera feed for corner selection
+        cv2.imshow("Select Corners", frame)
+        cv2.waitKey(1)
         continue
-
-    # Step 2: Define the target iPad screen dimensions (e.g., Full HD resolution for projection)
-    ipad_width, ipad_height = 1920, 1080  # Define as per your projection display
-    pts1 = np.float32(ipad_corners)
-    pts2 = np.float32([[0, 0], [ipad_width, 0], [ipad_width, ipad_height], [0, ipad_height]])
-
-    # Compute the perspective transform matrix
-    matrix = cv2.getPerspectiveTransform(pts1, pts2)
-
-    # Convert frame to RGB for MediaPipe processing
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+    # Once 4 corners are selected, apply perspective correction
+    corrected_frame = apply_perspective_correction(frame)
+    
+    # Draw the 4 corners on the corrected frame
+    draw_corners(corrected_frame, ipad_corners, w, h)
+    
+    # Convert image to RGB for MediaPipe
+    rgb_frame = cv2.cvtColor(corrected_frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb_frame)
-
-    # Check for hand landmarks
+    
+    # Draw the hand landmarks and finger pointer on the corrected frame
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
-            # Get fingertip position of index finger (Landmark 8)
+            # Extract the index finger tip (Landmark 8)
             x = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * w
             y = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * h
-
-            # Transform finger coordinates to the iPad screen space
-            input_coords = np.array([[x, y]], dtype='float32')
-            input_coords = np.array([input_coords])
-            ipad_coords = cv2.perspectiveTransform(input_coords, matrix)
-            screen_x, screen_y = int(ipad_coords[0][0][0]), int(ipad_coords[0][0][1])
-
-            # Draw the pointer circle on the frame at the fingertip position
-            cv2.circle(frame, (int(x), int(y)), 10, (255, 0, 0), cv2.FILLED)
             
-            # Optionally draw the landmarks for visualization
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            # Map the coordinates to the screen size (the projected screen)
+            screen_x, screen_y = map_to_screen(x, y, w, h)
+            
+            # Draw the pointer (circle) at the finger tip position
+            cv2.circle(corrected_frame, (screen_x, screen_y), 10, (255, 0, 0), cv2.FILLED)  # Blue pointer
+            
+            # Optionally draw the hand landmarks for visualization
+            mp_drawing.draw_landmarks(corrected_frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-    # Display the frame
-    cv2.imshow('Finger Tracker', frame)
+    # Display the frame with perspective correction and hand tracking
+    cv2.imshow('Finger Tracker', corrected_frame)
     
-    # Exit on pressing 'q'
+    # Exit loop on pressing 'q'
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
