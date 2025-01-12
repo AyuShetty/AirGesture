@@ -1,130 +1,172 @@
 import cv2
 import numpy as np
 import mediapipe as mp
+import time
+from collections import deque
 
 # Initialize MediaPipe Hands
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
-
-# Initialize MediaPipe Drawing utilities to visualize hand landmarks
 mp_drawing = mp.solutions.drawing_utils
 
-# Set up camera
-cap = cv2.VideoCapture(0)  # Use 0 for the default webcam, replace with your webcam device ID
+# Initialize variables
+corner_count = 0
+pts1 = []  # List to store corner points
+matrix = None
+hover_start_time = None
+hover_duration = 5  # Set the time for hovering over a corner (in seconds)
+fingertip_history = deque(maxlen=5)  # Track fingertip positions
+pointer_history = deque(maxlen=10)  # History for smoothing pointer movement
+last_time = time.time()
 
-# Define screen dimensions (adjust based on the projector resolution)
-screen_width, screen_height = 1920, 1080  # Example: Full HD resolution
+def draw_markers(frame, points):
+    """Draw markers for the registered corners."""
+    for i, pt in enumerate(points):
+        pt = tuple(map(int, pt))
+        cv2.circle(frame, pt, 10, (255, 0, 0), -1)
+        cv2.putText(frame, f"Corner {i + 1}", (pt[0] + 10, pt[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-# Coordinates for the 4 corners of the iPad (can be adjusted based on your setup)
-ipad_corners = []  # Initially empty, will be filled by user clicks
-projected_corners = [(0, 0), (screen_width, 0), (screen_width, screen_height), (0, screen_height)]  # Projection corners
+def map_to_screen(x, y, matrix):
+    """Map hand coordinates to screen coordinates using perspective transform."""
+    point = np.array([[x, y]], dtype='float32')
+    point = np.array([point])
+    transformed_point = cv2.perspectiveTransform(point, matrix)
+    return int(transformed_point[0][0][0]), int(transformed_point[0][0][1])
 
-# Initialize perspective transformation variables
-pts2 = np.array(projected_corners, dtype="float32")  # Destination points on the projected screen
-pts1 = []  # Initialize as an empty list instead of None
+def calculate_scaling_factor(current_pos, fingertip_history, dt):
+    """Calculate the movement scaling factor based on speed."""
+    if len(fingertip_history) < 2:
+        return 1
 
-def map_to_screen(x, y, frame_width, frame_height):
-    """
-    Map coordinates from camera frame to screen projection coordinates.
-    """
-    screen_x = int(x * screen_width / frame_width)
-    screen_y = int(y * screen_height / frame_height)
-    return screen_x, screen_y
+    prev_pos = fingertip_history[-2]
+    distance = np.linalg.norm(np.array(current_pos) - np.array(prev_pos))
+    speed = distance / dt if dt > 0 else 0
 
-def draw_corners(frame, corners, w, h):
-    """
-    Draw the four corner markers on the iPad screen in the camera feed.
-    """
-    for corner in corners:
-        x, y = corner
-        # Map the normalized corner coordinates to screen coordinates
-        screen_x, screen_y = map_to_screen(x, y, w, h)
-        # Draw a red marker at each corner
-        cv2.circle(frame, (screen_x, screen_y), 10, (0, 0, 255), cv2.FILLED)  # Red corner markers
+    # Adjust scaling factor based on speed
+    base_scale = 1
+    scale = min(max(base_scale * (speed / 15), 0.8), 2)  # Clamp between 0.8 and 2
+    return scale
 
-def apply_perspective_correction(frame):
-    """
-    Apply perspective correction to the frame using homography transformation.
-    """
-    global pts1
-    if len(pts1) < 4:
-        return frame  # If corners are not selected, return the original frame
-    
-    # Calculate the homography matrix
-    h_matrix, _ = cv2.findHomography(np.array(pts1, dtype="float32"), pts2)
-    
-    # Apply the perspective warp
-    corrected_frame = cv2.warpPerspective(frame, h_matrix, (screen_width, screen_height))
-    
-    return corrected_frame
+def smooth_pointer(pointer_history):
+    """Smooth pointer position using averaging."""
+    if not pointer_history:
+        return None
+    avg_x = int(np.mean([pos[0] for pos in pointer_history]))
+    avg_y = int(np.mean([pos[1] for pos in pointer_history]))
+    return avg_x, avg_y
 
-def select_corners(event, x, y, flags, param):
-    """
-    Callback function to select the 4 corners of the iPad screen.
-    """
-    global pts1
-    if event == cv2.EVENT_LBUTTONDOWN:
-        if len(pts1) < 4:
-            pts1.append([x, y])
-            cv2.circle(frame, (x, y), 10, (255, 0, 0), cv2.FILLED)
-            cv2.imshow("Select Corners", frame)
-            if len(pts1) == 4:
-                print("Four corners selected!")
-                cv2.destroyAllWindows()
+def auto_detect_corners(frame):
+    """Automatically detect the four corners of the screen."""
+    h, w, _ = frame.shape
+    return [
+        (50, 50),         # Top Left
+        (w - 50, 50),     # Top Right
+        (50, h - 50),     # Bottom Left
+        (w - 50, h - 50)  # Bottom Right
+    ]
 
-# Set up a mouse callback for selecting corners
-cv2.namedWindow("Select Corners")
-cv2.setMouseCallback("Select Corners", select_corners)
+# Open webcam
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Camera not accessible.")
+    exit()
 
-while cap.isOpened():
+print("Do you want to recognize corners automatically? (y/n)")
+manual_mode = input().strip().lower() != 'y'
+
+if not manual_mode:
+    print("Automatic mode selected! Corners will be detected automatically.")
+else:
+    print("Manual mode selected! Hover over each corner for 5 seconds to capture it.")
+
+while True:
     ret, frame = cap.read()
     if not ret:
+        print("Error: Unable to capture frame.")
         break
-    
-    # Flip frame horizontally for a mirror effect
+
     frame = cv2.flip(frame, 1)
     h, w, _ = frame.shape
-    
-    # Wait for the user to select the 4 corners of the iPad
-    if len(pts1) < 4:
-        # Show the live camera feed for corner selection
-        cv2.imshow("Select Corners", frame)
-        cv2.waitKey(1)
-        continue
-    
-    # Once 4 corners are selected, apply perspective correction
-    corrected_frame = apply_perspective_correction(frame)
-    
-    # Draw the 4 corners on the corrected frame
-    draw_corners(corrected_frame, ipad_corners, w, h)
-    
-    # Convert image to RGB for MediaPipe
-    rgb_frame = cv2.cvtColor(corrected_frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb_frame)
-    
-    # Draw the hand landmarks and finger pointer on the corrected frame
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            # Extract the index finger tip (Landmark 8)
-            x = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * w
-            y = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * h
-            
-            # Map the coordinates to the screen size (the projected screen)
-            screen_x, screen_y = map_to_screen(x, y, w, h)
-            
-            # Draw the pointer (circle) at the finger tip position
-            cv2.circle(corrected_frame, (screen_x, screen_y), 10, (255, 0, 0), cv2.FILLED)  # Blue pointer
-            
-            # Optionally draw the hand landmarks for visualization
-            mp_drawing.draw_landmarks(corrected_frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-    # Display the frame with perspective correction and hand tracking
-    cv2.imshow('Finger Tracker', corrected_frame)
-    
-    # Exit loop on pressing 'q'
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    if not manual_mode and corner_count == 0:
+        pts1 = auto_detect_corners(frame)
+        print("Automatic corner registration complete!")
+        for i, corner in enumerate(["Top Left", "Top Right", "Bottom Left", "Bottom Right"]):
+            print(f"{corner} registered at: {pts1[i]}")
+        corner_count = 4
+        matrix = cv2.getPerspectiveTransform(
+            np.array(pts1, dtype="float32"),
+            np.array([[0, 0], [w, 0], [0, h], [w, h]], dtype="float32")
+        )
+        print("Perspective transformation matrix calculated!")
 
-# Clean up
-cap.release()
-cv2.destroyAllWindows()
+    if manual_mode and corner_count < 4:
+        message = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"][corner_count]
+        cv2.putText(frame, f"Hover over the {message} corner to capture.",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb_frame)
+
+        fingertip = None
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                fingertip = (
+                    int(hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * w),
+                    int(hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * h)
+                )
+
+        if fingertip:
+            if hover_start_time is None:
+                hover_start_time = time.time()
+            elif time.time() - hover_start_time >= hover_duration:
+                pts1.append(fingertip)
+                print(f"{message} registered at: {pts1[-1]}")
+                corner_count += 1
+                hover_start_time = None
+        else:
+            hover_start_time = None
+
+        if pts1:
+            draw_markers(frame, pts1)
+
+    if manual_mode and corner_count == 4 and matrix is None:
+        print("Corner registration complete!")
+        pts1 = np.array(pts1, dtype="float32")
+        pts2 = np.array([[0, 0], [w, 0], [0, h], [w, h]], dtype="float32")
+        matrix = cv2.getPerspectiveTransform(pts1, pts2)
+        print("Perspective transformation matrix calculated!")
+
+    if matrix is not None:
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb_frame)
+
+        fingertip = None
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                fingertip = (
+                    int(hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * w),
+                    int(hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * h)
+                )
+
+        if fingertip:
+            current_time = time.time()
+            dt = current_time - last_time
+            last_time = current_time
+
+            fingertip_history.append(fingertip)
+            scale = calculate_scaling_factor(fingertip, fingertip_history, dt)
+
+            screen_x, screen_y = map_to_screen(fingertip[0] * scale, fingertip[1] * scale, matrix)
+            screen_x = min(max(screen_x, 0), w - 1)
+            screen_y = min(max(screen_y, 0), h - 1)
+
+            pointer_history.append((screen_x, screen_y))
+            smoothed_pointer = smooth_pointer(pointer_history)
+            if smoothed_pointer:
+                cv2.circle(frame, smoothed_pointer, 10, (0, 0, 255), -1)
+
+    cv2.imshow("Hand Tracking and Pointer", frame)
